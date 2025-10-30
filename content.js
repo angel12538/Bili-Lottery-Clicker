@@ -1,13 +1,14 @@
+// ========== 全局状态 ==========
 let intervalId = null;
 let currentIndex = 0;
-let links = [];
+let links = [];              // ✅ 真正存页面上找到的所有 /opus/ 链接
 let isRunning = false;
 
-// 创建悬浮面板 - 美化版本
+// ========== 创建悬浮面板 ==========
 function createFloatingPanel() {
   if (document.getElementById('bili-floating-panel')) return;
 
-  // 创建样式
+  // 样式
   const style = document.createElement('style');
   style.textContent = `
     #bili-floating-panel {
@@ -129,7 +130,7 @@ function createFloatingPanel() {
   `;
   document.head.appendChild(style);
 
-  // 创建面板
+  // 面板
   const panel = document.createElement('div');
   panel.id = 'bili-floating-panel';
   panel.innerHTML = `
@@ -152,28 +153,24 @@ function createFloatingPanel() {
 
   document.body.appendChild(panel);
 
-  // 按钮事件
+  // 事件
   document.getElementById('bili-start-btn').onclick = () => {
     startClicking();
-    document.getElementById('bili-status').textContent = '正在进行抽奖...';
-    document.getElementById('bili-start-btn').disabled = true;
   };
   
   document.getElementById('bili-stop-btn').onclick = () => {
     stopClicking();
-    document.getElementById('bili-status').textContent = '已停止';
-    document.getElementById('bili-start-btn').disabled = false;
   };
   
   document.getElementById('bili-close-btn').onclick = () => {
     panel.style.display = 'none';
   };
 
-  // 添加拖动功能
+  // 拖动
   makeDraggable(panel);
 }
 
-// 添加拖动功能
+// ========== 面板可拖动 ==========
 function makeDraggable(element) {
   const header = document.getElementById('bili-panel-header');
   let isDragging = false;
@@ -199,21 +196,18 @@ function makeDraggable(element) {
   });
 }
 
-// 更新面板计数器 - 增强版
+// ========== 更新面板 ==========
 function updateFloatingPanel(val) {
   const counter = document.getElementById('bili-counter');
   const progress = document.getElementById('bili-progress');
   if (!counter) return;
 
-  // 更新计数器
   counter.textContent = `已执行：${val} 个`;
   
-  // 如果有总数，更新进度条
   if (links && links.length > 0) {
     const percentage = (val / links.length) * 100;
     progress.style.width = `${percentage}%`;
     
-    // 更新状态文字
     const status = document.getElementById('bili-status');
     if (status) {
       if (val >= links.length) {
@@ -225,29 +219,41 @@ function updateFloatingPanel(val) {
   }
 }
 
-// 开始抽奖流程
+// ========== 开始抽奖 ==========
 function startClicking() {
   if (isRunning) return;
   isRunning = true;
 
-  const links = Array.from(document.querySelectorAll('a'))
-    .filter(a => a.innerText.trim().endsWith('份'))
-    .map(a => a.href);
+  // ✅ 只抓形如 https://www.bilibili.com/opus/123456789 的链接
+  links = Array.from(document.querySelectorAll('a'))
+    .map(a => a.href)
+    .filter(href => {
+      if (!href) return false;
+      // 严格一点：域名 + /opus/ + 数字
+      const opusRegex = /^https:\/\/www\.bilibili\.com\/opus\/\d+/;
+      return opusRegex.test(href);
+    });
 
   if (links.length === 0) {
-    alert('未找到可点击链接');
+    alert('未找到形如 https://www.bilibili.com/opus/... 的抽奖链接');
     isRunning = false;
     return;
   }
 
-  // 发送消息给background.js开始处理
+  // 通知 background 开始处理
   chrome.runtime.sendMessage({
     action: "startProcess",
     links: links
   });
+
+  // 更新状态
+  const status = document.getElementById('bili-status');
+  if (status) status.textContent = `已发现 ${links.length} 条抽奖入口，开始处理...`;
+  const startBtn = document.getElementById('bili-start-btn');
+  if (startBtn) startBtn.disabled = true;
 }
 
-// 停止抽奖流程
+// ========== 停止抽奖 ==========
 function stopClicking() {
   if (!isRunning) return;
   
@@ -257,25 +263,30 @@ function stopClicking() {
   
   isRunning = false;
   updateFloatingPanel(0);
+
+  const status = document.getElementById('bili-status');
+  if (status) status.textContent = '已停止';
+  const startBtn = document.getElementById('bili-start-btn');
+  if (startBtn) startBtn.disabled = false;
 }
 
-// 点击"互动抽奖"按钮 - 添加随机延迟
+// ========== 点“互动抽奖”入口 ==========
 function clickInteractiveLotteryButton() {
   console.log("正在查找互动抽奖按钮...");
-  
-  // 简化按钮查找，使用更精确的选择器
+
+  // 1. 尝试标准类名
   const lotteryLinks = Array.from(document.querySelectorAll('a[data-type="lottery"], a.lottery'));
+
+  // 2. 文本兜底
   const textLinks = Array.from(document.querySelectorAll('a, span, div'))
-    .filter(el => el.textContent && 
-           el.textContent.includes('互动抽奖') && 
+    .filter(el => el.textContent &&
+           el.textContent.includes('互动抽奖') &&
            el.offsetParent !== null);
-  
-  // 合并找到的按钮
+
   const allButtons = [...lotteryLinks, ...textLinks];
   console.log(`找到 ${allButtons.length} 个可能的互动抽奖按钮`);
-  
+
   if (allButtons.length > 0) {
-    // 添加随机延迟(300-800毫秒)后点击按钮
     const randomDelay = Math.floor(Math.random() * 500) + 300;
     console.log(`将在${randomDelay}ms后点击互动抽奖按钮`);
     
@@ -286,7 +297,7 @@ function clickInteractiveLotteryButton() {
     
     return true;
   } else {
-    // 缩短重试延迟到随机值(300-700毫秒)
+    // 没找到 → 稍微重试一次
     const retryDelay = Math.floor(Math.random() * 400) + 300;
     console.log(`未找到互动抽奖按钮，将在${retryDelay}ms后重试`);
     
@@ -300,7 +311,6 @@ function clickInteractiveLotteryButton() {
       if (retryButtons.length > 0) {
         retryButtons[0].click();
         console.log('重试：已点击互动抽奖按钮');
-        // 随机等待时间(600-1000毫秒)再执行下一步
         const nextDelay = Math.floor(Math.random() * 400) + 600;
         console.log(`将在${nextDelay}ms后查找关注按钮`);
         setTimeout(performLotteryAction, nextDelay);
@@ -314,23 +324,22 @@ function clickInteractiveLotteryButton() {
   }
 }
 
-// 关注并转发抽奖 - 修复版本
+// ========== 弹窗里“关注并转发” ==========
 function performLotteryAction(retryCount = 0) {
   console.log(`尝试查找关注并转发按钮... (尝试 ${retryCount + 1}/3)`);
   
-  // 主流程 - 合并查找逻辑，避免多余的函数调用
   let buttons = [];
   
-  // 1. 尝试在iframe中查找
+  // 1) iframe 里找
   const iframe = document.querySelector('iframe.bili-popup__content__browser');
   if (iframe) {
     try {
       const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
       const iframeButtons = [
         ...Array.from(iframeDoc.querySelectorAll('.join-button')),
-        ...Array.from(iframeDoc.querySelectorAll('button, a, div')).filter(el => 
-          el.textContent && 
-          el.textContent.includes('关注UP主并转发抽奖动态') && 
+        ...Array.from(iframeDoc.querySelectorAll('button, a, div')).filter(el =>
+          el.textContent &&
+          el.textContent.includes('关注UP主并转发抽奖动态') &&
           el.offsetParent !== null
         )
       ];
@@ -340,15 +349,15 @@ function performLotteryAction(retryCount = 0) {
     }
   }
   
-  // 2. 如果iframe中没找到，尝试在弹窗中查找
+  // 2) 普通弹窗里找
   if (buttons.length === 0) {
     const popupWrap = document.querySelector('.bili-popup__wrap');
     if (popupWrap) {
       const popupButtons = [
         ...Array.from(popupWrap.querySelectorAll('.join-button')),
-        ...Array.from(popupWrap.querySelectorAll('button, a, div')).filter(el => 
-          el.textContent && 
-          el.textContent.includes('关注UP主并转发抽奖动态') && 
+        ...Array.from(popupWrap.querySelectorAll('button, a, div')).filter(el =>
+          el.textContent &&
+          el.textContent.includes('关注UP主并转发抽奖动态') &&
           el.offsetParent !== null
         )
       ];
@@ -357,7 +366,6 @@ function performLotteryAction(retryCount = 0) {
   }
   
   if (buttons.length > 0) {
-    // 延长点击前等待时间 (600-1200毫秒)
     const clickDelay = Math.floor(Math.random() * 600) + 600;
     console.log(`找到关注并转发按钮，将在${clickDelay}ms后点击`);
     
@@ -365,7 +373,6 @@ function performLotteryAction(retryCount = 0) {
       buttons[0].click();
       console.log('已点击关注并转发按钮');
       
-      // 延长操作完成后的等待时间 (1200-2000毫秒)
       const completeDelay = Math.floor(Math.random() * 800) + 1200;
       console.log(`将在${completeDelay}ms后关闭页面`);
       
@@ -378,14 +385,13 @@ function performLotteryAction(retryCount = 0) {
     
     return true;
   } else {
-    // 未找到按钮
+    // 没找到，最多 3 次
     if (retryCount < 2) {
-      // 最多重试2次，总共尝试3次
       console.log(`未找到关注并转发按钮，将在1500ms后重试 (${retryCount + 1}/3)`);
       setTimeout(() => {
         performLotteryAction(retryCount + 1);
       }, 1500);
-      return false; // 这里返回false表示当前未找到按钮
+      return false;
     } else {
       console.log('重试3次后仍未找到关注并转发按钮，关闭页面返回合集');
       setTimeout(() => {
@@ -398,20 +404,20 @@ function performLotteryAction(retryCount = 0) {
   }
 }
 
-// 优化消息监听器中的延迟
+// ========== 消息监听 ==========
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "updateCounter") {
+    // 后台说：已经完成了第 message.count 个
     updateFloatingPanel(message.count);
     sendResponse({success: true});
   }
   else if (message.action === "performLotteryInteraction") {
-    // 增加初始等待时间 (500-1000毫秒)
+    // 后台说：当前这个 tab 是真正的抽奖页，让你去点
     const startDelay = Math.floor(Math.random() * 500) + 500;
     console.log(`页面加载完成，将在${startDelay}ms后开始互动`);
     
     setTimeout(() => {
       if (clickInteractiveLotteryButton()) {
-        // 添加等待时间后调用performLotteryAction
         const popupDelay = Math.floor(Math.random() * 500) + 1000;
         console.log(`已点击互动抽奖按钮，将在${popupDelay}ms后查找关注转发按钮`);
         
@@ -427,10 +433,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.action === "processComplete") {
     isRunning = false;
     alert('所有抽奖链接处理完成！');
+    const startBtn = document.getElementById('bili-start-btn');
+    if (startBtn) startBtn.disabled = false;
+    const status = document.getElementById('bili-status');
+    if (status) status.textContent = '任务已完成！';
     sendResponse({success: true});
   }
   return true;
 });
- 
-// 页面加载时立即插入悬浮面板
+
+// ========== 页面加载时插入面板 ==========
 window.addEventListener('load', createFloatingPanel);
