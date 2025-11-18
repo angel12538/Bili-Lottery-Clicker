@@ -1,34 +1,83 @@
-// ================================
-// Bili Lottery Clicker - content.js
-// - 同时支持 https://www.bilibili.com/opus/<id>
-// - 以及 https://t.bilibili.com/<id>（统一规范化为 opus）
-// - 悬浮面板 + 实时采集 + 风控/验证码检测 + 交互重试
-// ================================
+/** ========== 可配置项（集中管理） ========== */
+const CONFIG = {
+  // 抓取规则
+  supportTLinks: true,               // 支持 t.bilibili.com/<id>
+  onlyViewport: false,                // 是否只采集“当前视口内可见”的链接
+  autoScrollLoad: true,              // 采集中自动轻缓滚动以触发懒加载（合集页更有用）
+  autoScrollStep: 600,               // 每次滚动步长(px)
+  autoScrollInterval: 1200,          // 滚动间隔(ms)
 
-// ---------- 常量与工具 ----------
+  // 延时（人类化抖动）
+  delayClickEntry: [300, 800],       // 点击“互动抽奖”按钮前抖动
+  delayFindPopup: [1000, 1500],      // 点击入口后，等待弹窗稳定再找按钮
+  delayClickJoin: [600, 1200],       // 点击“关注并转发”前抖动
+  delayAfterJoin: [1200, 2000],      // 点击后通知完成前的等待
+
+  // 重试与等待
+  popupAppearTimeout: 5000,          // 等待弹窗出现的最长时间
+  maxFindJoinRetries: 3,             // 查找“关注并转发”最大重试次数
+  moThrottle: 500,                   // MutationObserver 触发节流(ms)
+
+  // 验证码关键字
+  captchaKeywords: ['验证码','安全验证','请完成验证','点击验证','机器人验证'],
+
+  // 文本关键词（可拓展）
+  entryTexts: ['互动抽奖','参与抽奖','立即参与','去参与'],
+  joinTexts: [
+    '关注up主并转发抽奖动态',
+    '关注并转发','一键参与','参与并转发',
+    '关注UP主并转发抽奖动态'
+  ],
+};
+
+/** ========== 工具 ==========
+ * 注意：尽量只用轻量工具避免触发站点风控
+ */
 const OPUS_RE  = /^https:\/\/www\.bilibili\.com\/opus\/(\d+)(?:[?#].*)?$/;
 const TDYN_RE  = /^https:\/\/t\.bilibili\.com\/(\d+)(?:[?#].*)?$/;
-
 const JITTER = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const VISIBLE = (el) => el && el.offsetParent !== null;
-const normalizeText = (s) => (s || "").replace(/\s+/g, "").trim();
+const normText = (s) => (s || "").replace(/\s+/g, "").trim();
 
-// 把 t.bilibili.com/<id> 统一成 www.bilibili.com/opus/<id>
 function normalizeLink(url) {
   const m1 = url.match(OPUS_RE);
   if (m1) return `https://www.bilibili.com/opus/${m1[1]}`;
+  if (!CONFIG.supportTLinks) return null;
   const m2 = url.match(TDYN_RE);
   if (m2) return `https://www.bilibili.com/opus/${m2[1]}`;
   return null;
 }
 
-// ---------- 全局状态 ----------
-let links = [];          // 已收集的目标链接（统一为 opus 形式）
-let isRunning = false;   // 当前是否在跑
-let hasAlerted = false;  // 防止重复 alert
-let mo = null;           // MutationObserver 用于动态页面持续采集
+function inViewport(el) {
+  if (!el || !el.getBoundingClientRect) return false;
+  const r = el.getBoundingClientRect();
+  const vw = window.innerWidth || document.documentElement.clientWidth;
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  return r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+}
 
-// ---------- UI：悬浮面板 ----------
+function waitFor(predicate, { timeout = 3000, interval = 100 } = {}) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    const timer = setInterval(() => {
+      if (predicate()) { clearInterval(timer); resolve(true); return; }
+      if (performance.now() - start > timeout) { clearInterval(timer); resolve(false); }
+    }, interval);
+  });
+}
+
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** ========== 全局状态 ========== */
+let isRunning = false;
+let hasAlerted = false;
+let links = [];             // 统一存 opus 链接
+const seenIds = new Set();  // 去重（按 opus id）
+let mo = null;              // MutationObserver
+let io = null;              // IntersectionObserver（仅用于 onlyViewport）
+let autoScrollTimer = null;
+
+/** ========== 面板 UI ========== */
 function createFloatingPanel() {
   if (document.getElementById('bili-floating-panel')) return;
 
@@ -72,12 +121,12 @@ function createFloatingPanel() {
   `;
   document.body.appendChild(panel);
 
-  // 恢复面板位置（localStorage，不占扩展权限）
+  // 恢复位置
   const savedPos = localStorage.getItem('blc-panel-pos');
   if (savedPos) {
     try {
       const { left, top } = JSON.parse(savedPos);
-      if (typeof left === 'number' && typeof top === 'number') {
+      if (Number.isFinite(left) && Number.isFinite(top)) {
         panel.style.left = `${left}px`;
         panel.style.top = `${top}px`;
         panel.style.right = 'auto';
@@ -103,10 +152,9 @@ function makeDraggable(element) {
   });
   document.addEventListener('mousemove', (e) => {
     if (!isDragging) return;
-    const left = e.clientX - offsetX;
-    const top = e.clientY - offsetY;
+    const left = e.clientX - offsetX, top = e.clientY - offsetY;
     element.style.left = `${left}px`;
-    element.style.top = `${top}px`;
+    element.style.top  = `${top}px`;
     element.style.right = 'auto';
     element.style.bottom = 'auto';
   });
@@ -124,10 +172,9 @@ function setStatus(text) {
 }
 
 function updateFloatingPanel(done) {
-  const counter = document.getElementById('bili-counter');
+  const counter  = document.getElementById('bili-counter');
   const progress = document.getElementById('bili-progress');
-  if (!counter) return;
-  counter.textContent = `已执行：${done} 个`;
+  if (counter) counter.textContent = `已执行：${done} 个`;
   if (links && links.length > 0 && progress) {
     const pct = Math.min(100, (done / links.length) * 100);
     progress.style.width = `${pct}%`;
@@ -136,78 +183,124 @@ function updateFloatingPanel(done) {
   }
 }
 
-// ---------- 链接采集 ----------
-function collectOpusLinks() {
-  const set = new Set(links); // 保留已采集
-  const anchors = Array.from(document.querySelectorAll('a[href]'));
-  for (const a of anchors) {
+/** ========== 采集：支持视口过滤与自动滚动加载 ========== */
+function captureFromAnchors() {
+  const anchors = document.querySelectorAll('a[href]');
+  const hereNorm = normalizeLink(location.href);
+  let added = 0;
+
+  anchors.forEach(a => {
     const href = a.href;
-    if (!href) continue;
-    // 只接受符合规则的链接，然后统一规范化
-    if (OPUS_RE.test(href) || TDYN_RE.test(href)) {
-      const norm = normalizeLink(href);
-      if (!norm) continue;
-      // 排除当前页自身（无论当前是 opus 还是 t 链接）
-      const hereNorm = normalizeLink(location.href);
-      if (hereNorm && hereNorm === norm) continue;
-      set.add(norm);
+    if (!href) return;
+    const norm = normalizeLink(href);
+    if (!norm) return;
+    if (hereNorm && hereNorm === norm) return; // 排除当前页
+    if (CONFIG.onlyViewport && !inViewport(a)) return; // 仅视口
+
+    const idMatch = norm.match(/\/opus\/(\d+)/);
+    const id = idMatch ? idMatch[1] : null;
+    if (id && !seenIds.has(id)) {
+      seenIds.add(id);
+      links.push(norm);
+      added++;
     }
-  }
-  links = Array.from(set);
-}
-
-function startObserver() {
-  if (mo) return;
-  mo = new MutationObserver(() => {
-    if (!isRunning) return;
-    collectOpusLinks();
   });
-  mo.observe(document.body, { childList: true, subtree: true });
+
+  return added;
 }
 
-function stopObserver() {
-  if (mo) {
-    mo.disconnect();
-    mo = null;
+let moTimer = null;
+function startObservers() {
+  // MutationObserver（懒加载/无限流）
+  if (!mo) {
+    mo = new MutationObserver(() => {
+      if (!isRunning) return;
+      if (moTimer) return;
+      moTimer = setTimeout(() => {
+        moTimer = null;
+        const n = captureFromAnchors();
+        if (n > 0) setStatus(`已发现 ${links.length} 条抽奖入口…`);
+      }, CONFIG.moThrottle);
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // IntersectionObserver（仅在只采视口时，选择性增强）
+  if (CONFIG.onlyViewport && !io) {
+    io = new IntersectionObserver((entries) => {
+      if (!isRunning) return;
+      let added = 0;
+      for (const e of entries) {
+        if (e.isIntersecting && e.target.href) {
+          const norm = normalizeLink(e.target.href);
+          if (!norm) continue;
+          const id = (norm.match(/\/opus\/(\d+)/) || [])[1];
+          if (id && !seenIds.has(id)) {
+            seenIds.add(id);
+            links.push(norm);
+            added++;
+          }
+        }
+      }
+      if (added > 0) setStatus(`已发现 ${links.length} 条抽奖入口…`);
+    }, { rootMargin: '0px 0px 100px 0px' });
+
+    document.querySelectorAll('a[href]').forEach(a => io.observe(a));
+  }
+
+  // 自动轻滚触发懒加载（更像真人）
+  if (CONFIG.autoScrollLoad && !autoScrollTimer) {
+    autoScrollTimer = setInterval(() => {
+      if (!isRunning) return;
+      window.scrollBy({ top: CONFIG.autoScrollStep, left: 0, behavior: 'smooth' });
+    }, CONFIG.autoScrollInterval);
   }
 }
 
-// ---------- 验证码 / 安全验证 ----------
+function stopObservers() {
+  if (mo) { mo.disconnect(); mo = null; }
+  if (io) { io.disconnect(); io = null; }
+  if (autoScrollTimer) { clearInterval(autoScrollTimer); autoScrollTimer = null; }
+}
+
+/** ========== 验证码检测与暂停 ========== */
 function detectCaptcha() {
-  const keywords = ['验证码', '安全验证', '请完成验证', '点击验证', '机器人验证'];
-  const textHit = keywords.some(k => document.body.innerText.includes(k));
+  const hitText = CONFIG.captchaKeywords.some(k => (document.body.innerText || '').includes(k));
   const geetest =
     document.querySelector('.geetest_panel') ||
     document.querySelector('iframe[src*="geetest"]') ||
     document.querySelector('iframe[src*="captcha"]');
-  return Boolean(textHit || geetest);
+  return Boolean(hitText || geetest);
 }
 
 function handleCaptchaPause() {
-  setStatus('检测到验证码，已暂停，请手动完成后点“开始”继续');
+  setStatus('检测到验证码，已暂停。请先完成验证，再点击“开始”继续。');
   const startBtn = document.getElementById('bili-start-btn');
   if (startBtn) startBtn.disabled = false;
   isRunning = false;
   chrome.runtime.sendMessage({ action: "stopProcess" });
 }
 
-// ---------- 任务控制 ----------
+/** ========== 任务控制：开始/停止 ========== */
 function startClicking() {
   if (isRunning) return;
   isRunning = true;
   hasAlerted = false;
+  links = [];
+  seenIds.clear();
 
-  collectOpusLinks();
-  startObserver(); // 动态页面边跑边补链
+  const added = captureFromAnchors();
+  startObservers();
 
-  if (links.length === 0) {
+  if ((added + links.length) === 0) {
     setStatus('未找到 https://www.bilibili.com/opus/... 或 https://t.bilibili.com/... 链接');
     isRunning = false;
+    stopObservers();
     return;
   }
 
   chrome.runtime.sendMessage({ action: "startProcess", links });
-  setStatus(`已发现 ${links.length} 条抽奖入口，开始处理...`);
+  setStatus(`已发现 ${links.length} 条抽奖入口，开始处理…`);
   const startBtn = document.getElementById('bili-start-btn');
   if (startBtn) startBtn.disabled = true;
 }
@@ -216,179 +309,164 @@ function stopClicking() {
   if (!isRunning) return;
   chrome.runtime.sendMessage({ action: "stopProcess" });
   isRunning = false;
-  stopObserver();
+  stopObservers();
   updateFloatingPanel(0);
   setStatus('已停止');
   const startBtn = document.getElementById('bili-start-btn');
   if (startBtn) startBtn.disabled = false;
 }
 
-// ---------- 元素查找 ----------
+/** ========== 元素定位 ========== */
 function findInteractiveButtons(root = document) {
-  const list = [
-    ...Array.from(root.querySelectorAll('a[data-type="lottery"], a.lottery, button.lottery')),
-    ...Array.from(root.querySelectorAll('button, a, div')).filter((el) => {
-      if (!VISIBLE(el)) return false;
-      const t = normalizeText(el.textContent);
-      return (
-        t.includes('互动抽奖') ||
-        t.includes('参与抽奖') ||
-        t.includes('立即参与') ||
-        t.includes('去参与')
-      );
-    })
-  ];
-  return Array.from(new Set(list));
+  // 结构/属性优先
+  const structural = root.querySelectorAll('a[data-type="lottery"], a.lottery, button.lottery');
+  const byText = Array.from(root.querySelectorAll('button, a, div'))
+    .filter(el => VISIBLE(el) && CONFIG.entryTexts.some(k => normText(el.textContent).includes(k)));
+  return Array.from(new Set([...Array.from(structural), ...byText]));
 }
 
 function findFollowRepostButtons(root = document) {
-  const list = [
-    ...Array.from(root.querySelectorAll('.join-button')),
-    ...Array.from(root.querySelectorAll('button, a, div')).filter((el) => {
-      if (!VISIBLE(el)) return false;
-      const t = normalizeText(el.textContent);
-      return (
-        t.includes('关注up主并转发抽奖动态') ||
-        t.includes('关注并转发') ||
-        t.includes('一键参与') ||
-        t.includes('参与并转发')
-      );
-    })
-  ];
-  return Array.from(new Set(list));
+  const joinClass = root.querySelectorAll('.join-button');
+  const byText = Array.from(root.querySelectorAll('button, a, div'))
+    .filter(el => VISIBLE(el) && CONFIG.joinTexts.some(k => normText(el.textContent).includes(k)));
+  return Array.from(new Set([...Array.from(joinClass), ...byText]));
 }
 
-// ---------- 点击“互动抽奖”入口 ----------
-function clickInteractiveLotteryButton() {
-  if (detectCaptcha()) {
-    handleCaptchaPause();
-    return false;
-  }
+/** ========== 点击“互动抽奖”入口 ========== */
+async function clickInteractiveLotteryButton() {
+  if (detectCaptcha()) { handleCaptchaPause(); return false; }
 
-  console.log("查找互动抽奖按钮...");
+  // 先找，再做一次短时间等待（防止动画/延迟渲染）
   let candidates = findInteractiveButtons(document);
-
-  // 常见弹层容器兜底
   if (candidates.length === 0) {
     const wrap = document.querySelector('.bili-popup__wrap') || document.body;
     candidates = findInteractiveButtons(wrap);
   }
-
-  // 再兜底：全局文本匹配（限制可见）
   if (candidates.length === 0) {
+    // 兜底：可见文本扫描
     const textLinks = Array.from(document.querySelectorAll('a, span, div'))
-      .filter(el => VISIBLE(el) && /互动抽奖|参与抽奖|立即参与|去参与/.test(el.textContent || ''));
+      .filter(el => VISIBLE(el) && CONFIG.entryTexts.some(k => (el.textContent || '').includes(k)));
     candidates = textLinks;
   }
 
-  console.log(`互动抽奖候选：${candidates.length} 个`);
   if (candidates.length === 0) return false;
 
-  const delay = JITTER(300, 800);
-  console.log(`将在 ${delay}ms 后点击互动抽奖按钮`);
-  setTimeout(() => {
-    if (detectCaptcha()) return handleCaptchaPause();
-    candidates[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-    console.log('已点击互动抽奖按钮');
-  }, delay);
+  // 滚到视口中心，提高“人类化”
+  candidates[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
 
+  const delay = JITTER(...CONFIG.delayClickEntry);
+  setStatus('正在进入抽奖弹窗…');
+  await wait(delay);
+  if (detectCaptcha()) { handleCaptchaPause(); return false; }
+
+  candidates[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
   return true;
 }
 
-// ---------- 弹窗里的“关注并转发” ----------
-function performLotteryAction(retryCount = 0) {
-  if (detectCaptcha()) {
-    handleCaptchaPause();
+/** ========== 弹窗里的“关注并转发” ========== */
+async function performLotteryAction(retryCount = 0) {
+  if (detectCaptcha()) { handleCaptchaPause(); return false; }
+
+  // 等弹窗出现
+  const popupOk = await waitFor(() => {
+    return document.querySelector('.bili-popup__wrap')
+      || document.querySelector('iframe.bili-popup__content__browser, .bili-popup__content iframe');
+  }, { timeout: CONFIG.popupAppearTimeout, interval: 150 });
+
+  if (!popupOk) {
+    if (retryCount < CONFIG.maxFindJoinRetries - 1) {
+      await wait(500);
+      return performLotteryAction(retryCount + 1);
+    }
+    // 弹窗都没出现，直接跳过
+    chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
     return false;
   }
 
-  console.log(`查找关注并转发... (尝试 ${retryCount + 1}/3)`);
+  // 在弹窗内找按钮（iframe 优先）
   let buttons = [];
-
-  // 1) 弹层 iframe（同源时）
   const iframe = document.querySelector('iframe.bili-popup__content__browser, .bili-popup__content iframe');
   if (iframe) {
     try {
       const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (doc) {
-        buttons = findFollowRepostButtons(doc);
-      }
-    } catch (e) {
-      console.warn("访问 iframe 受限：", e);
-    }
+      if (doc) buttons = findFollowRepostButtons(doc);
+    } catch (e) { /* 跨域则忽略，走外层 */ }
   }
-
-  // 2) 普通弹窗容器
   if (buttons.length === 0) {
     const wrap = document.querySelector('.bili-popup__wrap') || document;
     buttons = findFollowRepostButtons(wrap);
   }
 
-  if (buttons.length > 0) {
-    const clickDelay = JITTER(600, 1200);
-    console.log(`找到关注并转发按钮，将在 ${clickDelay}ms 后点击`);
-    setTimeout(() => {
-      if (detectCaptcha()) return handleCaptchaPause();
-      buttons[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      console.log('已点击关注并转发按钮');
-      const completeDelay = JITTER(1200, 2000);
-      console.log(`将在 ${completeDelay}ms 后通知完成`);
-      setTimeout(() => chrome.runtime.sendMessage({ action: "notifyInteractionComplete" }), completeDelay);
-    }, clickDelay);
-    return true;
-  }
-
-  if (retryCount < 2) {
-    const wait = 1500;
-    console.log(`未找到，${wait}ms 后重试`);
-    setTimeout(() => performLotteryAction(retryCount + 1), wait);
+  if (buttons.length === 0) {
+    if (retryCount < CONFIG.maxFindJoinRetries - 1) {
+      await wait(800);
+      return performLotteryAction(retryCount + 1);
+    }
+    // 仍没找到，温柔跳过
+    chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
     return false;
   }
 
-  console.log('重试 3 次仍未找到，跳过此页');
-  setTimeout(() => chrome.runtime.sendMessage({ action: "notifyInteractionComplete" }), 600);
-  return false;
+  // 滚动至按钮 → 抖动 → 点击
+  buttons[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
+  const clickDelay = JITTER(...CONFIG.delayClickJoin);
+  setStatus('即将关注并转发…');
+  await wait(clickDelay);
+  if (detectCaptcha()) { handleCaptchaPause(); return false; }
+
+  buttons[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+  const completeDelay = JITTER(...CONFIG.delayAfterJoin);
+  await wait(completeDelay);
+
+  chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
+  return true;
 }
 
-// ---------- 与 background 消息通信 ----------
+/** ========== 与 background 通信 ========== */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "updateCounter") {
     updateFloatingPanel(message.count);
     sendResponse?.({ success: true });
   }
   else if (message.action === "performLotteryInteraction") {
-    const startDelay = JITTER(500, 1000);
-    console.log(`页面加载完成，${startDelay}ms 后开始互动`);
-    setTimeout(() => {
-      if (detectCaptcha()) {
-        handleCaptchaPause();
+    (async () => {
+      const startDelay = JITTER(500, 1000);
+      setStatus('页面已加载，准备开始互动…');
+      await wait(startDelay);
+
+      if (detectCaptcha()) { handleCaptchaPause(); return sendResponse?.({ success: true }); }
+
+      const entered = await clickInteractiveLotteryButton();
+      if (!entered) {
+        // 未找到入口，直接跳过
+        chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
         return sendResponse?.({ success: true });
       }
-      if (clickInteractiveLotteryButton()) {
-        const popupDelay = JITTER(1000, 1500);
-        console.log(`已点击入口，${popupDelay}ms 后查找关注并转发`);
-        setTimeout(() => performLotteryAction(0), popupDelay);
-      } else {
-        chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
-      }
-    }, startDelay);
+
+      const popupDelay = JITTER(...CONFIG.delayFindPopup);
+      await wait(popupDelay);
+      await performLotteryAction(0);
+
+      sendResponse?.({ success: true });
+    })();
     return true; // 异步响应
   }
   else if (message.action === "processComplete") {
     isRunning = false;
-    stopObserver();
+    stopObservers();
     if (!hasAlerted) {
       hasAlerted = true;
-      try { alert('所有抽奖链接处理完成！'); } catch {}
+      // 仅做状态提示，不打断用户
+      setStatus('任务已完成！');
     }
     const startBtn = document.getElementById('bili-start-btn');
     if (startBtn) startBtn.disabled = false;
-    setStatus('任务已完成！');
     sendResponse?.({ success: true });
   }
 });
 
-// ---------- 启动 ----------
+/** ========== 启动 ========== */
 window.addEventListener('load', () => {
   createFloatingPanel();
 });
