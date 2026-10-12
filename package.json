@@ -1,0 +1,9 @@
+{
+  "name": "bili-lottery-clicker",
+  "version": "4.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/background.test.cjs tests/content.test.cjs",
+    "check": "node --check shared.js && node --check background.js && node --check content.js"
+  }
+}

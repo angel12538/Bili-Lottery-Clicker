@@ -1,472 +1,459 @@
-/** ========== 可配置项（集中管理） ========== */
-const CONFIG = {
-  // 抓取规则
-  supportTLinks: true,               // 支持 t.bilibili.com/<id>
-  onlyViewport: false,                // 是否只采集“当前视口内可见”的链接
-  autoScrollLoad: true,              // 采集中自动轻缓滚动以触发懒加载（合集页更有用）
-  autoScrollStep: 600,               // 每次滚动步长(px)
-  autoScrollInterval: 1200,          // 滚动间隔(ms)
+(() => {
+  'use strict';
+  const CONFIG = {
+    supportTLinks: true, onlyViewport: false, autoScrollLoad: true,
+    autoScrollStep: 600, autoScrollInterval: 1200, moThrottle: 500,
+    delayClickEntry: [300, 800], delayFindPopup: [1000, 1500],
+    delayClickJoin: [600, 1200], delayAfterJoin: [1200, 2000],
+    entryTimeout: 5000, popupAppearTimeout: 5000, joinTimeout: 7000,
+    captchaKeywords: ['验证码', '安全验证', '请完成验证', '点击验证', '机器人验证'],
+    entryTexts: ['互动抽奖', '参与抽奖', '立即参与', '去参与'],
+    joinTexts: ['关注up主并转发抽奖动态', '关注并转发', '一键参与', '参与并转发'],
+  };
+  const { normalizeLink, jitter } = BiliLottery;
+  const normalize = value => (value || '').replace(/\s+/g, '').toLowerCase();
+  const linkSelector = new URL(location.href).hostname === 't.bilibili.com'
+    ? 'a[href]' : 'a[href*="/opus/"], a[href*="t.bilibili.com/"]';
+  const popupSelector = '.bili-popup__wrap, [role="dialog"]';
+  const frameSelector = 'iframe.bili-popup__content__browser, .bili-popup__content iframe';
+  let processState = null;
+  let collecting = false;
+  let observer = null, intersection = null, scrollTimer = null, flushTimer = null, viewportTimer = null;
+  let activeTask = null, lastTaskId = null, joinAttempted = false;
+  let starting = false, stopping = false;
+  const seen = new Set();
+  const pending = new Set();
 
-  // 延时（人类化抖动）
-  delayClickEntry: [300, 800],       // 点击“互动抽奖”按钮前抖动
-  delayFindPopup: [1000, 1500],      // 点击入口后，等待弹窗稳定再找按钮
-  delayClickJoin: [600, 1200],       // 点击“关注并转发”前抖动
-  delayAfterJoin: [1200, 2000],      // 点击后通知完成前的等待
-
-  // 重试与等待
-  popupAppearTimeout: 5000,          // 等待弹窗出现的最长时间
-  maxFindJoinRetries: 3,             // 查找“关注并转发”最大重试次数
-  moThrottle: 500,                   // MutationObserver 触发节流(ms)
-
-  // 验证码关键字
-  captchaKeywords: ['验证码','安全验证','请完成验证','点击验证','机器人验证'],
-
-  // 文本关键词（可拓展）
-  entryTexts: ['互动抽奖','参与抽奖','立即参与','去参与'],
-  joinTexts: [
-    '关注up主并转发抽奖动态',
-    '关注并转发','一键参与','参与并转发',
-    '关注UP主并转发抽奖动态'
-  ],
-};
-
-/** ========== 工具 ==========
- * 注意：尽量只用轻量工具避免触发站点风控
- */
-const OPUS_RE  = /^https:\/\/www\.bilibili\.com\/opus\/(\d+)(?:[?#].*)?$/;
-const TDYN_RE  = /^https:\/\/t\.bilibili\.com\/(\d+)(?:[?#].*)?$/;
-const JITTER = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-const VISIBLE = (el) => el && el.offsetParent !== null;
-const normText = (s) => (s || "").replace(/\s+/g, "").trim();
-
-function normalizeLink(url) {
-  const m1 = url.match(OPUS_RE);
-  if (m1) return `https://www.bilibili.com/opus/${m1[1]}`;
-  if (!CONFIG.supportTLinks) return null;
-  const m2 = url.match(TDYN_RE);
-  if (m2) return `https://www.bilibili.com/opus/${m2[1]}`;
-  return null;
-}
-
-function inViewport(el) {
-  if (!el || !el.getBoundingClientRect) return false;
-  const r = el.getBoundingClientRect();
-  const vw = window.innerWidth || document.documentElement.clientWidth;
-  const vh = window.innerHeight || document.documentElement.clientHeight;
-  return r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
-}
-
-function waitFor(predicate, { timeout = 3000, interval = 100 } = {}) {
-  return new Promise((resolve) => {
-    const start = performance.now();
-    const timer = setInterval(() => {
-      if (predicate()) { clearInterval(timer); resolve(true); return; }
-      if (performance.now() - start > timeout) { clearInterval(timer); resolve(false); }
-    }, interval);
-  });
-}
-
-const wait = (ms) => new Promise(r => setTimeout(r, ms));
-
-/** ========== 全局状态 ========== */
-let isRunning = false;
-let hasAlerted = false;
-let links = [];             // 统一存 opus 链接
-const seenIds = new Set();  // 去重（按 opus id）
-let mo = null;              // MutationObserver
-let io = null;              // IntersectionObserver（仅用于 onlyViewport）
-let autoScrollTimer = null;
-
-/** ========== 面板 UI ========== */
-function createFloatingPanel() {
-  if (document.getElementById('bili-floating-panel')) return;
-
-  const style = document.createElement('style');
-  style.textContent = `
-    #bili-floating-panel{position:fixed;bottom:20px;right:20px;background:#fff;color:#212121;padding:0;border-radius:8px;font-size:14px;z-index:99999;font-family:"Microsoft YaHei","Segoe UI",sans-serif;box-shadow:0 2px 10px rgba(0,0,0,0.15);width:240px;transition:all .3s ease;overflow:hidden;border:1px solid #e3e5e7}
-    #bili-panel-header{background:#FB7299;color:#fff;padding:8px 12px;font-weight:700;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none;border-top-left-radius:8px;border-top-right-radius:8px}
-    #bili-panel-content{padding:12px}
-    #bili-counter{background:#f4f4f4;border-radius:4px;padding:8px;margin:8px 0;font-size:13px;text-align:center}
-    #bili-status{font-size:12px;margin-top:8px;color:#6d757a;text-align:center;min-height:16px}
-    .bili-btn{border:none;padding:8px 0;margin:0;cursor:pointer;background:#fff;color:#212121;font-size:14px;border-radius:4px;transition:all .2s;font-weight:700;width:49%;border:1px solid #e3e5e7}
-    .bili-btn:hover{background:#f4f4f4}
-    #bili-start-btn{background:#FB7299;color:#fff;border:1px solid #FB7299}
-    #bili-start-btn:hover{background:#fc85a8}
-    #bili-start-btn:disabled{background:#ffb6c9;cursor:not-allowed}
-    #bili-stop-btn:hover{color:#FB7299}
-    #bili-control-buttons{display:flex;justify-content:space-between;width:100%}
-    #bili-close-btn{background:none;border:none;color:#fff;cursor:pointer;font-size:16px;padding:0;margin:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center}
-    #bili-close-btn:hover{background:rgba(255,255,255,.2);border-radius:50%}
-    .progress-bar{height:4px;background:#e3e5e7;border-radius:2px;margin-top:6px;overflow:hidden}
-    .progress-fill{height:100%;background:#FB7299;width:0%;transition:width .3s}
-  `;
-  document.head.appendChild(style);
-
-  const panel = document.createElement('div');
-  panel.id = 'bili-floating-panel';
-  panel.innerHTML = `
-    <div id="bili-panel-header">
-      <span>B站抽奖助手</span>
-      <button id="bili-close-btn">✕</button>
-    </div>
-    <div id="bili-panel-content">
-      <div id="bili-control-buttons">
-        <button id="bili-start-btn" class="bili-btn">开始</button>
-        <button id="bili-stop-btn" class="bili-btn">停止</button>
-      </div>
-      <div id="bili-counter">已执行：0 个</div>
-      <div class="progress-bar"><div class="progress-fill" id="bili-progress"></div></div>
-      <div id="bili-status">准备就绪</div>
-    </div>
-  `;
-  document.body.appendChild(panel);
-
-  // 恢复位置
-  const savedPos = localStorage.getItem('blc-panel-pos');
-  if (savedPos) {
-    try {
-      const { left, top } = JSON.parse(savedPos);
-      if (Number.isFinite(left) && Number.isFinite(top)) {
-        panel.style.left = `${left}px`;
-        panel.style.top = `${top}px`;
-        panel.style.right = 'auto';
-        panel.style.bottom = 'auto';
-      }
-    } catch {}
+  async function message(payload) {
+    const response = await chrome.runtime.sendMessage(payload);
+    if (!response?.success) throw new Error(response?.error || '扩展后台未响应，请刷新页面');
+    return response;
   }
 
-  document.getElementById('bili-start-btn').onclick = startClicking;
-  document.getElementById('bili-stop-btn').onclick = stopClicking;
-  document.getElementById('bili-close-btn').onclick = () => (panel.style.display = 'none');
-  makeDraggable(panel);
-}
-
-function makeDraggable(element) {
-  const header = document.getElementById('bili-panel-header');
-  let isDragging = false, offsetX = 0, offsetY = 0;
-  header.addEventListener('mousedown', (e) => {
-    isDragging = true;
-    const rect = element.getBoundingClientRect();
-    offsetX = e.clientX - rect.left;
-    offsetY = e.clientY - rect.top;
-  });
-  document.addEventListener('mousemove', (e) => {
-    if (!isDragging) return;
-    const left = e.clientX - offsetX, top = e.clientY - offsetY;
-    element.style.left = `${left}px`;
-    element.style.top  = `${top}px`;
-    element.style.right = 'auto';
-    element.style.bottom = 'auto';
-  });
-  document.addEventListener('mouseup', () => {
-    if (!isDragging) return;
-    isDragging = false;
-    const rect = element.getBoundingClientRect();
-    localStorage.setItem('blc-panel-pos', JSON.stringify({ left: rect.left, top: rect.top }));
-  });
-}
-
-function setStatus(text) {
-  const el = document.getElementById('bili-status');
-  if (el) el.textContent = text;
-}
-
-function updateFloatingPanel(done) {
-  const counter  = document.getElementById('bili-counter');
-  const progress = document.getElementById('bili-progress');
-  if (counter) counter.textContent = `已执行：${done} 个`;
-  if (links && links.length > 0 && progress) {
-    const pct = Math.min(100, (done / links.length) * 100);
-    progress.style.width = `${pct}%`;
-    if (done >= links.length) setStatus('任务已完成！');
-    else if (isRunning) setStatus(`进行中 (${done}/${links.length})`);
+  function setStatus(text) {
+    const element = document.getElementById('bili-status');
+    if (element) element.textContent = text;
   }
-}
 
-/** ========== 采集：支持视口过滤与自动滚动加载 ========== */
-function captureFromAnchors() {
-  const anchors = document.querySelectorAll('a[href]');
-  const hereNorm = normalizeLink(location.href);
-  let added = 0;
+  function visible(element) {
+    if (!element?.isConnected || element.closest?.('#bili-floating-panel')) return false;
+    if (!element.getClientRects().length) return false;
+    const style = element.ownerDocument.defaultView.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse'
+      && style.opacity !== '0';
+  }
 
-  anchors.forEach(a => {
-    const href = a.href;
-    if (!href) return;
-    const norm = normalizeLink(href);
-    if (!norm) return;
-    if (hereNorm && hereNorm === norm) return; // 排除当前页
-    if (CONFIG.onlyViewport && !inViewport(a)) return; // 仅视口
+  function inViewport(element) {
+    if (!visible(element)) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+  }
 
-    const idMatch = norm.match(/\/opus\/(\d+)/);
-    const id = idMatch ? idMatch[1] : null;
-    if (id && !seenIds.has(id)) {
-      seenIds.add(id);
-      links.push(norm);
-      added++;
-    }
-  });
+  function createFloatingPanel() {
+    if (document.getElementById('bili-floating-panel')) return;
+    const style = document.createElement('style');
+    style.textContent = `
+      #bili-floating-panel{position:fixed;bottom:20px;right:20px;background:#fff;color:#212121;border-radius:8px;font:14px "Microsoft YaHei","Segoe UI",sans-serif;z-index:99999;box-shadow:0 2px 10px #0002;width:260px;max-width:100vw;overflow:hidden;border:1px solid #e3e5e7}
+      #bili-floating-panel[hidden]{display:none!important}
+      #bili-panel-header{background:#FB7299;color:#fff;padding:8px 12px;font-weight:700;display:flex;justify-content:space-between;align-items:center;cursor:move;user-select:none}
+      #bili-panel-content{padding:12px}
+      #bili-counter{background:#f4f4f4;border-radius:4px;padding:8px;margin:8px 0;font-size:12px;text-align:center}
+      #bili-status{font-size:12px;margin-top:8px;color:#6d757a;text-align:center;min-height:16px;overflow-wrap:anywhere}
+      #bili-floating-panel .bili-btn{padding:8px 0;cursor:pointer;background:#fff;color:#212121;border-radius:4px;font-size:14px;font-weight:700;width:49%;border:1px solid #e3e5e7}
+      #bili-floating-panel .bili-btn:hover{background:#f4f4f4}
+      #bili-floating-panel #bili-start-btn{background:#FB7299;color:#fff}
+      #bili-floating-panel .bili-btn:disabled{opacity:.5;cursor:not-allowed}
+      #bili-control-buttons{display:flex;justify-content:space-between}
+      #bili-close-btn{background:none;border:none;color:#fff;cursor:pointer;font-size:16px;width:24px;height:24px}
+      #bili-floating-panel .progress-bar{height:4px;background:#e3e5e7;border-radius:2px;overflow:hidden}
+      #bili-progress{height:100%;background:#FB7299;width:0%;transition:width .3s}
+    `;
+    document.head.appendChild(style);
+    const panel = document.createElement('div');
+    panel.id = 'bili-floating-panel';
+    panel.innerHTML = `
+      <div id="bili-panel-header"><span>B站抽奖助手</span><button type="button" id="bili-close-btn" aria-label="隐藏面板">✕</button></div>
+      <div id="bili-panel-content">
+        <div id="bili-control-buttons"><button type="button" id="bili-start-btn" class="bili-btn">开始</button><button type="button" id="bili-stop-btn" class="bili-btn" disabled>停止</button></div>
+        <div id="bili-counter">已处理：0 / 0 · 已点击：0 · 跳过：0</div>
+        <div class="progress-bar"><div id="bili-progress"></div></div>
+        <div id="bili-status" role="status" aria-live="polite">准备就绪</div>
+      </div>`;
+    document.body.appendChild(panel);
+    document.getElementById('bili-start-btn').onclick = () => { void startClicking(); };
+    document.getElementById('bili-stop-btn').onclick = () => { void stopClicking(); };
+    document.getElementById('bili-close-btn').onclick = () => { panel.hidden = true; };
+    makeDraggable(panel);
+    if (processState) renderState();
+    chrome.storage.local.get('panelPosition').then(data => {
+      const { left, top } = data.panelPosition || {};
+      if (Number.isFinite(left) && Number.isFinite(top) && !panel.dataset.moved) positionPanel(panel, left, top);
+    }).catch(() => {});
+  }
 
-  return added;
-}
+  function positionPanel(panel, left, top) {
+    const rect = panel.getBoundingClientRect();
+    panel.style.left = `${Math.max(0, Math.min(left, window.innerWidth - rect.width))}px`;
+    panel.style.top = `${Math.max(0, Math.min(top, window.innerHeight - rect.height))}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
 
-let moTimer = null;
-function startObservers() {
-  // MutationObserver（懒加载/无限流）
-  if (!mo) {
-    mo = new MutationObserver(() => {
-      if (!isRunning) return;
-      if (moTimer) return;
-      moTimer = setTimeout(() => {
-        moTimer = null;
-        const n = captureFromAnchors();
-        if (n > 0) setStatus(`已发现 ${links.length} 条抽奖入口…`);
-      }, CONFIG.moThrottle);
+  function makeDraggable(panel) {
+    const header = document.getElementById('bili-panel-header');
+    let offset = null;
+    header.addEventListener('mousedown', event => {
+      if (event.button !== 0 || event.target.closest('button')) return;
+      const rect = panel.getBoundingClientRect();
+      offset = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      panel.dataset.moved = 'true';
+      event.preventDefault();
     });
-    mo.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener('mousemove', event => {
+      if (offset) positionPanel(panel, event.clientX - offset.x, event.clientY - offset.y);
+    });
+    const endDrag = () => {
+      if (!offset) return;
+      offset = null;
+      const { left, top } = panel.getBoundingClientRect();
+      void chrome.storage.local.set({ panelPosition: { left, top } }).catch(() => {});
+    };
+    document.addEventListener('mouseup', endDrag);
+    window.addEventListener('blur', endDrag);
+    window.addEventListener('resize', () => {
+      if (panel.hidden) return;
+      const { left, top } = panel.getBoundingClientRect();
+      positionPanel(panel, left, top);
+    });
   }
 
-  // IntersectionObserver（仅在只采视口时，选择性增强）
-  if (CONFIG.onlyViewport && !io) {
-    io = new IntersectionObserver((entries) => {
-      if (!isRunning) return;
-      let added = 0;
-      for (const e of entries) {
-        if (e.isIntersecting && e.target.href) {
-          const norm = normalizeLink(e.target.href);
-          if (!norm) continue;
-          const id = (norm.match(/\/opus\/(\d+)/) || [])[1];
-          if (id && !seenIds.has(id)) {
-            seenIds.add(id);
-            links.push(norm);
-            added++;
+  function renderState() {
+    if (!processState) return;
+    const state = processState;
+    const belongs = state.isSource || state.isTask;
+    const start = document.getElementById('bili-start-btn');
+    const stop = document.getElementById('bili-stop-btn');
+    if (start) {
+      start.disabled = starting || (state.running && belongs) || (state.phase === 'paused' && state.isTask);
+      start.textContent = state.phase === 'paused' && state.isSource ? '继续' : '开始';
+    }
+    if (stop) stop.disabled = stopping || !belongs || (!state.running && state.phase !== 'paused');
+    const counter = document.getElementById('bili-counter');
+    const progress = document.getElementById('bili-progress');
+    if (counter) counter.textContent = `已处理：${state.count} / ${state.total} · 已点击：${state.clicked} · 跳过：${state.skipped}`;
+    if (progress) progress.style.width = `${state.total ? Math.min(100, state.count / state.total * 100) : 0}%`;
+    if (!belongs && (state.running || state.phase === 'paused')) setStatus('其他页面有任务正在运行或暂停');
+    else if (state.phase === 'paused') setStatus(state.reason);
+    else if (state.running) setStatus(state.phase === 'draining' ? '等待懒加载的新链接…' : `进行中 (${state.count}/${state.total})`);
+    else if (belongs) setStatus(state.reason || '准备就绪');
+  }
+
+  function applyState(state) {
+    processState = state;
+    if (state.running && state.isSource) {
+      if (!collecting) startObservers();
+    } else { stopObservers(); }
+    renderState();
+  }
+
+  function collectAnchor(anchor) {
+    const link = normalizeLink(anchor.href, CONFIG.supportTLinks);
+    if (!link || link === normalizeLink(location.href) || (CONFIG.onlyViewport && !inViewport(anchor))) return;
+    if (seen.has(link)) return;
+    seen.add(link);
+    pending.add(link);
+    scheduleFlush();
+  }
+
+  function captureFromAnchors(root = document) {
+    const anchors = [];
+    if (root.matches?.(linkSelector)) anchors.push(root);
+    if (root.querySelectorAll) anchors.push(...root.querySelectorAll(linkSelector));
+    for (const anchor of anchors) {
+      if (CONFIG.onlyViewport && collecting) intersection?.observe(anchor);
+      collectAnchor(anchor);
+    }
+  }
+
+  function scheduleFlush() {
+    if (!collecting || flushTimer || !pending.size) return;
+    flushTimer = setTimeout(() => { flushTimer = null; void flushLinks(); }, CONFIG.moThrottle);
+  }
+
+  async function flushLinks() {
+    if (!collecting || !pending.size) return;
+    const sessionId = processState.sessionId;
+    const batch = [...pending];
+    try {
+      await message({ action: 'appendLinks', sessionId, links: batch });
+      if (processState.sessionId === sessionId) batch.forEach(link => pending.delete(link));
+    } catch (error) {
+      if (collecting && processState.sessionId === sessionId) {
+        stopObservers();
+        setStatus(error.message);
+      }
+    }
+    scheduleFlush();
+  }
+
+  function captureViewport() {
+    if (viewportTimer || !collecting) return;
+    viewportTimer = setTimeout(() => {
+      viewportTimer = null;
+      if (collecting) captureFromAnchors();
+    }, CONFIG.moThrottle);
+  }
+
+  function startObservers() {
+    collecting = true;
+    if (CONFIG.onlyViewport) {
+      intersection = new IntersectionObserver(entries => {
+        if (collecting) entries.forEach(entry => { if (entry.isIntersecting) collectAnchor(entry.target); });
+      });
+      window.addEventListener('scroll', captureViewport, { passive: true });
+    }
+    // Inspect only changed subtrees. Panel updates cannot trigger a full-page scan.
+    observer = new MutationObserver(records => {
+      if (!collecting) return;
+      for (const record of records) {
+        if (record.target.closest?.('#bili-floating-panel')) continue;
+        if (record.type === 'attributes') captureFromAnchors(record.target);
+        else record.addedNodes.forEach(node => captureFromAnchors(node));
+        if (intersection) record.removedNodes.forEach(node => {
+          if (node.matches?.('a[href]')) intersection.unobserve(node);
+          node.querySelectorAll?.('a[href]').forEach(anchor => intersection.unobserve(anchor));
+        });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+    captureFromAnchors();
+    if (CONFIG.autoScrollLoad) scrollTimer = setInterval(() => {
+      if (collecting) window.scrollBy({ top: CONFIG.autoScrollStep, left: 0, behavior: 'smooth' });
+    }, CONFIG.autoScrollInterval);
+  }
+
+  function stopObservers() {
+    collecting = false;
+    observer?.disconnect();
+    intersection?.disconnect();
+    observer = intersection = null;
+    clearInterval(scrollTimer);
+    clearTimeout(flushTimer);
+    clearTimeout(viewportTimer);
+    scrollTimer = flushTimer = viewportTimer = null;
+    window.removeEventListener('scroll', captureViewport);
+  }
+
+  async function startClicking() {
+    if (starting || (processState?.running && (processState.isSource || processState.isTask))) return;
+    starting = true;
+    document.getElementById('bili-start-btn').disabled = true;
+    seen.clear(); pending.clear();
+    captureFromAnchors();
+    try {
+      const response = await message({ action: 'startProcess', links: [...pending] });
+      applyState(response.state);
+    } catch (error) { setStatus(error.message); }
+    finally {
+      starting = false;
+      const button = document.getElementById('bili-start-btn');
+      renderState();
+      if (!processState) button.disabled = false;
+    }
+  }
+
+  async function stopClicking() {
+    if (stopping || !processState?.sessionId) return;
+    stopping = true;
+    stopObservers();
+    activeTask?.controller.abort();
+    try {
+      await message({ action: 'stopProcess', sessionId: processState.sessionId, taskId: activeTask?.taskId });
+    } catch (error) { setStatus(error.message); }
+    finally { stopping = false; renderState(); }
+  }
+
+  function wait(ms, signal) {
+    return new Promise((resolve, reject) => {
+      signal.throwIfAborted();
+      const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+      const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  async function waitFor(predicate, timeout, signal) {
+    const deadline = performance.now() + timeout;
+    do {
+      signal.throwIfAborted();
+      const found = predicate();
+      if (found) return found;
+      await wait(Math.min(150, Math.max(1, deadline - performance.now())), signal);
+    } while (performance.now() < deadline);
+    return null;
+  }
+
+  function enabled(element) {
+    return visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
+      && !element.closest('[inert]');
+  }
+
+  function findButtons(root, texts, structural) {
+    const preferred = [...root.querySelectorAll(structural)].filter(enabled);
+    if (preferred.length) return preferred;
+    const matches = [...root.querySelectorAll('button, a, [role="button"], div, span')]
+      .filter(element => texts.some(text => normalize(element.textContent).includes(normalize(text))) && enabled(element));
+    // Discard broad ancestors containing a more specific matching element.
+    const ancestors = new Set();
+    for (const element of matches) {
+      for (let parent = element.parentElement; parent; parent = parent.parentElement) ancestors.add(parent);
+    }
+    const leaves = matches.filter(element => !ancestors.has(element));
+    const clickable = leaves.map(element => element.closest('button, a, [role="button"]') || element).filter(enabled);
+    return [...new Set([...preferred, ...clickable])];
+  }
+
+  function popupDocuments() {
+    const roots = [...document.querySelectorAll(popupSelector)].filter(visible);
+    for (const frame of document.querySelectorAll(frameSelector)) {
+      if (!visible(frame)) continue;
+      try { if (frame.contentDocument) roots.unshift(frame.contentDocument); }
+      catch { /* Cross-origin frames require a different integration; do not scan the page instead. */ }
+    }
+    return roots;
+  }
+
+  function detectCaptcha() {
+    const roots = [document, ...popupDocuments()];
+    for (const root of roots) {
+      const widgets = root.querySelectorAll('.geetest_panel, iframe[src*="geetest"], iframe[src*="captcha"]');
+      if ([...widgets].some(visible)) return true;
+      const candidates = root.querySelectorAll('[role="dialog"], .bili-popup__wrap, [class*="captcha"], [class*="geetest"]');
+      if ([...candidates].some(element => visible(element)
+        && CONFIG.captchaKeywords.some(keyword => (element.innerText || '').includes(keyword)))) return true;
+    }
+    return false;
+  }
+
+  async function checkCaptcha(task) {
+    task.controller.signal.throwIfAborted();
+    if (!detectCaptcha()) return false;
+    task.paused = true;
+    await message({ action: 'pauseProcess', sessionId: task.sessionId, taskId: task.taskId });
+    setStatus('已暂停，请先完成验证码，再在来源页点击“继续”');
+    return true;
+  }
+
+  async function waitForInteraction(predicate, timeout, task) {
+    const captcha = Symbol('captcha');
+    const result = await waitFor(() => detectCaptcha() ? captcha : predicate(), timeout, task.controller.signal);
+    if (result !== captcha) return result;
+    await checkCaptcha(task);
+    return null;
+  }
+
+  async function clickCandidate(element, delays, task) {
+    const signal = task.controller.signal;
+    element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await wait(jitter(...delays), signal);
+    if (await checkCaptcha(task)) return false;
+    signal.throwIfAborted();
+    if (!enabled(element)) return false;
+    element.click();
+    return true;
+  }
+
+  async function runInteraction(task) {
+    const signal = task.controller.signal;
+    let outcome = 'skipped', reason = '未找到可用的抽奖入口';
+    try {
+      await wait(jitter(500, 1000), signal);
+      if (await checkCaptcha(task)) return;
+      if (joinAttempted) {
+        // Verification may appear after the join click. Do not click again on resume.
+        outcome = 'clicked'; reason = '';
+      } else {
+        if (!popupDocuments().length) {
+          const entry = await waitForInteraction(() => findButtons(document, CONFIG.entryTexts,
+            'a[data-type="lottery"], a.lottery, button.lottery')[0], CONFIG.entryTimeout, task);
+          if (!entry || !await clickCandidate(entry, CONFIG.delayClickEntry, task)) {
+            if (signal.aborted || task.paused) return;
+            await complete(task, outcome, reason); return;
+          }
+        }
+        await wait(jitter(...CONFIG.delayFindPopup), signal);
+        const popup = await waitForInteraction(() => popupDocuments().length, CONFIG.popupAppearTimeout, task);
+        if (await checkCaptcha(task)) return;
+        reason = popup ? '未找到可用的关注转发按钮（可能已参与或弹窗跨域）' : '抽奖弹窗未出现';
+        if (popup) {
+          const button = await waitForInteraction(() => popupDocuments().flatMap(root =>
+            findButtons(root, CONFIG.joinTexts, '.join-button'))[0], CONFIG.joinTimeout, task);
+          if (button && await clickCandidate(button, CONFIG.delayClickJoin, task)) {
+            joinAttempted = true;
+            await wait(jitter(...CONFIG.delayAfterJoin), signal);
+            if (await checkCaptcha(task)) return;
+            outcome = 'clicked'; reason = '';
           }
         }
       }
-      if (added > 0) setStatus(`已发现 ${links.length} 条抽奖入口…`);
-    }, { rootMargin: '0px 0px 100px 0px' });
-
-    document.querySelectorAll('a[href]').forEach(a => io.observe(a));
-  }
-
-  // 自动轻滚触发懒加载（更像真人）
-  if (CONFIG.autoScrollLoad && !autoScrollTimer) {
-    autoScrollTimer = setInterval(() => {
-      if (!isRunning) return;
-      window.scrollBy({ top: CONFIG.autoScrollStep, left: 0, behavior: 'smooth' });
-    }, CONFIG.autoScrollInterval);
-  }
-}
-
-function stopObservers() {
-  if (mo) { mo.disconnect(); mo = null; }
-  if (io) { io.disconnect(); io = null; }
-  if (autoScrollTimer) { clearInterval(autoScrollTimer); autoScrollTimer = null; }
-}
-
-/** ========== 验证码检测与暂停 ========== */
-function detectCaptcha() {
-  const hitText = CONFIG.captchaKeywords.some(k => (document.body.innerText || '').includes(k));
-  const geetest =
-    document.querySelector('.geetest_panel') ||
-    document.querySelector('iframe[src*="geetest"]') ||
-    document.querySelector('iframe[src*="captcha"]');
-  return Boolean(hitText || geetest);
-}
-
-function handleCaptchaPause() {
-  setStatus('检测到验证码，已暂停。请先完成验证，再点击“开始”继续。');
-  const startBtn = document.getElementById('bili-start-btn');
-  if (startBtn) startBtn.disabled = false;
-  isRunning = false;
-  chrome.runtime.sendMessage({ action: "stopProcess" });
-}
-
-/** ========== 任务控制：开始/停止 ========== */
-function startClicking() {
-  if (isRunning) return;
-  isRunning = true;
-  hasAlerted = false;
-  links = [];
-  seenIds.clear();
-
-  const added = captureFromAnchors();
-  startObservers();
-
-  if ((added + links.length) === 0) {
-    setStatus('未找到 https://www.bilibili.com/opus/... 或 https://t.bilibili.com/... 链接');
-    isRunning = false;
-    stopObservers();
-    return;
-  }
-
-  chrome.runtime.sendMessage({ action: "startProcess", links });
-  setStatus(`已发现 ${links.length} 条抽奖入口，开始处理…`);
-  const startBtn = document.getElementById('bili-start-btn');
-  if (startBtn) startBtn.disabled = true;
-}
-
-function stopClicking() {
-  if (!isRunning) return;
-  chrome.runtime.sendMessage({ action: "stopProcess" });
-  isRunning = false;
-  stopObservers();
-  updateFloatingPanel(0);
-  setStatus('已停止');
-  const startBtn = document.getElementById('bili-start-btn');
-  if (startBtn) startBtn.disabled = false;
-}
-
-/** ========== 元素定位 ========== */
-function findInteractiveButtons(root = document) {
-  // 结构/属性优先
-  const structural = root.querySelectorAll('a[data-type="lottery"], a.lottery, button.lottery');
-  const byText = Array.from(root.querySelectorAll('button, a, div'))
-    .filter(el => VISIBLE(el) && CONFIG.entryTexts.some(k => normText(el.textContent).includes(k)));
-  return Array.from(new Set([...Array.from(structural), ...byText]));
-}
-
-function findFollowRepostButtons(root = document) {
-  const joinClass = root.querySelectorAll('.join-button');
-  const byText = Array.from(root.querySelectorAll('button, a, div'))
-    .filter(el => VISIBLE(el) && CONFIG.joinTexts.some(k => normText(el.textContent).includes(k)));
-  return Array.from(new Set([...Array.from(joinClass), ...byText]));
-}
-
-/** ========== 点击“互动抽奖”入口 ========== */
-async function clickInteractiveLotteryButton() {
-  if (detectCaptcha()) { handleCaptchaPause(); return false; }
-
-  // 先找，再做一次短时间等待（防止动画/延迟渲染）
-  let candidates = findInteractiveButtons(document);
-  if (candidates.length === 0) {
-    const wrap = document.querySelector('.bili-popup__wrap') || document.body;
-    candidates = findInteractiveButtons(wrap);
-  }
-  if (candidates.length === 0) {
-    // 兜底：可见文本扫描
-    const textLinks = Array.from(document.querySelectorAll('a, span, div'))
-      .filter(el => VISIBLE(el) && CONFIG.entryTexts.some(k => (el.textContent || '').includes(k)));
-    candidates = textLinks;
-  }
-
-  if (candidates.length === 0) return false;
-
-  // 滚到视口中心，提高“人类化”
-  candidates[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
-
-  const delay = JITTER(...CONFIG.delayClickEntry);
-  setStatus('正在进入抽奖弹窗…');
-  await wait(delay);
-  if (detectCaptcha()) { handleCaptchaPause(); return false; }
-
-  candidates[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-  return true;
-}
-
-/** ========== 弹窗里的“关注并转发” ========== */
-async function performLotteryAction(retryCount = 0) {
-  if (detectCaptcha()) { handleCaptchaPause(); return false; }
-
-  // 等弹窗出现
-  const popupOk = await waitFor(() => {
-    return document.querySelector('.bili-popup__wrap')
-      || document.querySelector('iframe.bili-popup__content__browser, .bili-popup__content iframe');
-  }, { timeout: CONFIG.popupAppearTimeout, interval: 150 });
-
-  if (!popupOk) {
-    if (retryCount < CONFIG.maxFindJoinRetries - 1) {
-      await wait(500);
-      return performLotteryAction(retryCount + 1);
-    }
-    // 弹窗都没出现，直接跳过
-    chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
-    return false;
-  }
-
-  // 在弹窗内找按钮（iframe 优先）
-  let buttons = [];
-  const iframe = document.querySelector('iframe.bili-popup__content__browser, .bili-popup__content iframe');
-  if (iframe) {
-    try {
-      const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (doc) buttons = findFollowRepostButtons(doc);
-    } catch (e) { /* 跨域则忽略，走外层 */ }
-  }
-  if (buttons.length === 0) {
-    const wrap = document.querySelector('.bili-popup__wrap') || document;
-    buttons = findFollowRepostButtons(wrap);
-  }
-
-  if (buttons.length === 0) {
-    if (retryCount < CONFIG.maxFindJoinRetries - 1) {
-      await wait(800);
-      return performLotteryAction(retryCount + 1);
-    }
-    // 仍没找到，温柔跳过
-    chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
-    return false;
-  }
-
-  // 滚动至按钮 → 抖动 → 点击
-  buttons[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
-  const clickDelay = JITTER(...CONFIG.delayClickJoin);
-  setStatus('即将关注并转发…');
-  await wait(clickDelay);
-  if (detectCaptcha()) { handleCaptchaPause(); return false; }
-
-  buttons[0].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-
-  const completeDelay = JITTER(...CONFIG.delayAfterJoin);
-  await wait(completeDelay);
-
-  chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
-  return true;
-}
-
-/** ========== 与 background 通信 ========== */
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === "updateCounter") {
-    updateFloatingPanel(message.count);
-    sendResponse?.({ success: true });
-  }
-  else if (message.action === "performLotteryInteraction") {
-    (async () => {
-      const startDelay = JITTER(500, 1000);
-      setStatus('页面已加载，准备开始互动…');
-      await wait(startDelay);
-
-      if (detectCaptcha()) { handleCaptchaPause(); return sendResponse?.({ success: true }); }
-
-      const entered = await clickInteractiveLotteryButton();
-      if (!entered) {
-        // 未找到入口，直接跳过
-        chrome.runtime.sendMessage({ action: "notifyInteractionComplete" });
-        return sendResponse?.({ success: true });
+      if (task.paused) return;
+      await complete(task, outcome, reason);
+    } catch (error) {
+      if (!signal.aborted) {
+        setStatus(error.message || '互动失败');
+        try { await complete(task, 'skipped', '互动脚本发生错误'); } catch { /* Background timeout handles disconnection. */ }
       }
-
-      const popupDelay = JITTER(...CONFIG.delayFindPopup);
-      await wait(popupDelay);
-      await performLotteryAction(0);
-
-      sendResponse?.({ success: true });
-    })();
-    return true; // 异步响应
+    } finally { if (activeTask === task) activeTask = null; }
   }
-  else if (message.action === "processComplete") {
-    isRunning = false;
-    stopObservers();
-    if (!hasAlerted) {
-      hasAlerted = true;
-      // 仅做状态提示，不打断用户
-      setStatus('任务已完成！');
-    }
-    const startBtn = document.getElementById('bili-start-btn');
-    if (startBtn) startBtn.disabled = false;
-    sendResponse?.({ success: true });
-  }
-});
 
-/** ========== 启动 ========== */
-window.addEventListener('load', () => {
-  createFloatingPanel();
-});
+  function complete(task, outcome, reason) {
+    task.controller.signal.throwIfAborted();
+    return message({ action: 'notifyInteractionComplete', sessionId: task.sessionId,
+      taskId: task.taskId, outcome, reason });
+  }
+
+  chrome.runtime.onMessage.addListener((payload, sender, respond) => {
+    if (sender.id !== chrome.runtime.id) return false;
+    if (payload.action === 'processState') {
+      applyState(payload.state); respond({ success: true });
+    } else if (payload.action === 'togglePanel') {
+      createFloatingPanel();
+      const panel = document.getElementById('bili-floating-panel');
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) synchronize();
+      respond({ success: true });
+    } else if (payload.action === 'cancelInteraction') {
+      if (activeTask?.taskId === payload.taskId) activeTask.controller.abort();
+      respond({ success: true });
+    } else if (payload.action === 'performLotteryInteraction') {
+      if (typeof payload.taskId !== 'string' || typeof payload.sessionId !== 'string') {
+        respond({ accepted: false }); return false;
+      }
+      if (payload.taskId !== lastTaskId) {
+        activeTask?.controller.abort();
+        lastTaskId = payload.taskId;
+        const task = { ...payload, controller: new AbortController() };
+        activeTask = task;
+        processState = { ...processState, sessionId: task.sessionId, isSource: false, isTask: true,
+          running: true, phase: 'interacting', count: 0, total: 1, clicked: 0, skipped: 0 };
+        renderState();
+        void runInteraction(task);
+      }
+      respond({ accepted: true });
+    } else { return false; }
+    return false;
+  });
+
+  function initialize() {
+    createFloatingPanel();
+    synchronize();
+  }
+  function synchronize() {
+    void message({ action: 'getProcessState' }).then(response => applyState(response.state)).catch(error => setStatus(error.message));
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
+  else initialize();
+  window.addEventListener('focus', synchronize);
+  window.addEventListener('pageshow', event => { if (event.persisted) synchronize(); });
+  window.addEventListener('pagehide', () => { stopObservers(); activeTask?.controller.abort(); });
+})();
